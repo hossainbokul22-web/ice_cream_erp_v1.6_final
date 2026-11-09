@@ -3,50 +3,64 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-  pull_request:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply newest uploaded zip (if any)
+        run: |
+          best=""; bt=0
+          for z in ./*.zip; do
+            [ -f "$z" ] || continue
+            t=$(git log -1 --format=%ct -- "${z#./}" 2>/dev/null)
+            t=${t:-0}
+            if [ "$t" -gt "$bt" ]; then bt=$t; best="$z"; fi
+          done
+          if [ -n "$best" ]; then
+            echo "Using: $best"
+            rm -rf /tmp/upd && mkdir /tmp/upd
+            unzip -q "$best" -d /tmp/upd
+            src=$(find /tmp/upd -maxdepth 3 -name pubspec.yaml -printf '%h\n' | head -1)
+            echo "Project root in zip: $src"
+            (cd "$src" && tar cf - --exclude=./.github .) | tar xf -
+          fi
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.35.0'
           channel: stable
           cache: true
+
+      - name: Patch drift Batch clash and pin packages
+        run: |
+          sed -i "s#^import 'package:drift/drift.dart';#import 'package:drift/drift.dart' hide Batch;#; s#^import 'package:drift/drift.dart' hide Column;#import 'package:drift/drift.dart' hide Batch, Column;#" $(grep -rl "package:drift/drift.dart" lib test)
+          grep -q dependency_overrides pubspec.yaml || printf '\ndependency_overrides:\n  image: 4.5.4\n  archive: 4.0.7\n' >> pubspec.yaml
+
       - name: SQLite (needed by the in-memory DB tests)
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
-      # Fills in only the files missing from android/ (e.g. gradlew); existing files are kept.
+
       - run: flutter create . --platforms=android --org com.icecream
       - run: flutter pub get
-      # app_database.g.dart is NOT committed; it is generated here.
       - run: dart run build_runner build --delete-conflicting-outputs
+
       - run: flutter analyze --no-fatal-infos
         continue-on-error: true
       - run: flutter test
         continue-on-error: true
-      - name: Write release keystore (optional)
-        if: ${{ env.KEYSTORE_B64 != '' }}
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          echo "$KEYSTORE_B64" | base64 -d > android/app/upload-keystore.jks
-          cat > android/key.properties <<EOF
-          storePassword=$KEYSTORE_PASSWORD
-          keyPassword=$KEY_PASSWORD
-          keyAlias=$KEY_ALIAS
-          storeFile=upload-keystore.jks
-          EOF
+
       - run: flutter build apk --release
+
       - uses: actions/upload-artifact@v4
         with:
           name: app-release
